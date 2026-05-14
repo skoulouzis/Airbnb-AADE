@@ -58,7 +58,8 @@ def main() -> None:
         "platform": "1",
         "is_foreigner": True,
         "passport_id": "AB123456",
-        "notes": "κωδικός_κράτησης:HMD2KFC4JB"
+        "notes": "κωδικός_κράτησης:HMD2KFC4JB",
+        "reservation_id": "HMD2KFC4JB"
     }
     aade = AADEDeclaration(
         headless=headless,
@@ -71,6 +72,7 @@ def main() -> None:
     )
     aade.create_new_declaration(declaration_data=declaration_data,
                                 submit=submit,
+                                save=True
                                 )
 
 

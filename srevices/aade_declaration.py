@@ -5,9 +5,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from trio import sleep
+
 try:
     from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException
+    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
     from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.common.by import By
     from selenium.webdriver.remote.webdriver import WebDriver
@@ -16,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime with explicit message
     webdriver = None
     TimeoutException = RuntimeError  # type: ignore[assignment]
+    StaleElementReferenceException = RuntimeError  # type: ignore[assignment]
     ChromeOptions = None
     By = None
     WebDriver = Any
@@ -302,10 +305,10 @@ class AADEDeclaration:
         """
         # --- Arrival date ---
         self._set_date_input("appForm:rentalFrom_input", declaration_data['arrival_date'])
-
+        sleep(0.5)
         # --- Departure date ---
         self._set_date_input("appForm:rentalTo_input", declaration_data['departure_date'])
-
+        sleep( 0.5)
         # --- Total agreed rent ---
         rent_input = self._first_visible([(By.ID, "appForm:sumAmount_input")])
         rent_input.clear()
@@ -331,6 +334,8 @@ class AADEDeclaration:
         # --- Foreigner checkbox + Passport ID ---
         is_foreigner = declaration_data.get('is_foreigner', False)
         passport_id = declaration_data.get('passport_id')
+        if not passport_id:
+            passport_id = declaration_data.get('reservation_id')  # fallback to reservation_id if passport_id not provided
         if is_foreigner:
             checkbox_box = self._first_clickable(
                 [(By.CSS_SELECTOR, "#appForm\\:foreignCheckBox .ui-chkbox-box")]
@@ -340,11 +345,24 @@ class AADEDeclaration:
 
             if passport_id:
                 # Field is enabled after checking the foreigner box.
-                passport_input = self.wait.until(
-                    EC.element_to_be_clickable((By.ID, "appForm:renterIdCard"))
+                passport_locator = (By.ID, "appForm:renterIdCard")
+                passport_wait = WebDriverWait(
+                    self.driver,
+                    self.timeout_seconds,
+                    ignored_exceptions=(StaleElementReferenceException,),
                 )
-                passport_input.clear()
-                passport_input.send_keys(passport_id)
+                for attempt in range(3):
+                    try:
+                        passport_input = passport_wait.until(
+                            EC.element_to_be_clickable(passport_locator)
+                        )
+                        passport_input.clear()
+                        passport_input.send_keys(str(passport_id))
+                        break
+                    except StaleElementReferenceException:
+                        if attempt == 2:
+                            self._take_screenshot("error_passport_stale_element")
+                            raise
 
         # --- Notes ---
         notes = declaration_data.get('notes')
@@ -385,5 +403,18 @@ class AADEDeclaration:
         elif save:
             self.save_draft()
 
-    def save_draft(self):
-        pass
+    def save_draft(self) -> None:
+        self._take_screenshot("before_save_draft")
+        self._first_clickable(
+            [
+                (By.XPATH,
+                 "//button[contains(., 'Προσωρινή Αποθήκευση') or contains(., 'Αποθήκευση') or contains(., 'Save Draft') or contains(., 'Save')]"),
+                (By.XPATH,
+                 "//a[contains(., 'Προσωρινή Αποθήκευση') or contains(., 'Αποθήκευση') or contains(., 'Save Draft') or contains(., 'Save')]"),
+                (By.CSS_SELECTOR, "button[id*='save']"),
+                (By.CSS_SELECTOR, "button[id*='draft']"),
+                (By.CSS_SELECTOR, "a[id*='save']"),
+                (By.CSS_SELECTOR, "a[id*='draft']"),
+            ]
+        ).click()
+        self._take_screenshot("after_save_draft_click")
