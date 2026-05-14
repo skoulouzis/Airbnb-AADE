@@ -2,39 +2,32 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
-from srevices.gmail_airbnb_parser import GmailAirbnbReader
+from srevices.gmai_reader import GmailReader
+from srevices.gmail_airbnb_parser import AirbnbMailParser
+from srevices.reservation_store import ReservationStore
 
 
-def load_emails(path: Path) -> list[dict]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    if isinstance(data, dict):
-        data = data.get("emails", [])
-
-    if not isinstance(data, list):
-        raise ValueError("Expected a JSON list of emails or an object with an 'emails' list.")
-
-    return data
+def default_credentials_path() -> Path:
+    candidates = [Path("credentials.json"), Path("client_secret.json"), *sorted(Path.cwd().glob("client_secret_*.json"))]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("credentials.json")
 
 
-def demo_emails() -> list[dict]:
-    return [
-        {
-            "from": "Airbnb <no-reply@airbnb.com>",
-            "subject": "Reservation confirmed",
-            "body": (
-                "Hi Jane Doe,\n"
-                "Your Airbnb reservation is confirmed.\n"
-                "Check-in: June 10, 2026\n"
-                "Check-out: June 15, 2026\n"
-                "Total paid: $1,245.67\n"
-                "Guest: Jane Doe\n"
-            ),
-        }
-    ]
+def build_reservation_gmail_query(year: int, month: int, extra_query: str | None = None) -> str:
+    start = datetime(year, month, 1)
+    end = datetime(year + (month // 12), (month % 12) + 1, 1)
+    query = (
+        f'from:airbnb (subject:"Reservation confirmed" OR subject:"Canceled: Reservation") '
+        f"after:{start.strftime('%Y/%m/%d')} before:{end.strftime('%Y/%m/%d')}"
+    )
+    if extra_query:
+        query = f"{query} {extra_query.strip()}"
+    return query
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,14 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to a JSON file containing email objects.",
     )
     parser.add_argument(
-        "--download",
-        action="store_true",
-        help="Download Airbnb emails from Gmail instead of reading a local JSON file.",
-    )
-    parser.add_argument(
         "--credentials",
         type=Path,
-        default=Path("credentials.json"),
+        default=default_credentials_path(),
         help="Path to the Google OAuth client secrets file.",
     )
     parser.add_argument(
@@ -73,15 +61,54 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional extra Gmail search terms to narrow the Airbnb download.",
     )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=Path("reservations_db.json"),
+        help="Path to the TinyDB JSON file used to store reservations.",
+    )
+    parser.add_argument(
+        "--year",
+        type=int,
+        default=datetime.now().year,
+        help="Year to use for the Gmail date range filter.",
+    )
+    parser.add_argument(
+        "--month",
+        type=int,
+        default=datetime.now().month,
+        choices=range(1, 13),
+        help="Month to use for the Gmail date range filter.",
+    )
     return parser
 
 
-def main() -> None:
-    reader = GmailAirbnbReader(credentials_path=Path("client_secret_839974854169-0qe6aoi7726adu2278dr2kfpmgs8ldgd.apps.googleusercontent.com.json"))
-    reservations = reader.get_reservations_for_month(2026, 4)
 
-    for r in reservations:
-        print(r)
+
+def main() -> None:
+    args = build_parser().parse_args()
+    query = build_reservation_gmail_query(args.year, args.month, args.query)
+
+    reader = GmailReader(credentials_path=str(args.credentials), token_path=str(args.token))
+    messages = reader.list_messages(query=query, max_results=args.max_results)
+
+    parser = AirbnbMailParser(messages=messages)
+    reservations = parser.get_reservations()
+
+    store = ReservationStore(args.db_path, table_name="reservations")
+    try:
+        summary = store.save_many(reservations)
+    finally:
+        store.close()
+
+    print(
+        f"Saved {summary['saved']} reservations to {args.db_path} "
+        f"({summary['inserted']} inserted, {summary['updated']} updated)."
+    )
+    for reservation in reservations:
+        print(json.dumps(reservation, ensure_ascii=False))
+
+
 
 
 

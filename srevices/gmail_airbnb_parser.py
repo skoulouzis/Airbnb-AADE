@@ -1,13 +1,9 @@
-import os
 import base64
 import re
+import subprocess
+import sys
 from typing import List, Dict, Optional
 from datetime import datetime
-
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 try:
     import spacy
@@ -17,71 +13,40 @@ except ImportError:
     HAS_SPACY = False
 
 
-class GmailAirbnbReader:
+class AirbnbMailParser:
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
-    def __init__(self, credentials_path='credentials.json', token_path='token.json'):
-        self.credentials_path = credentials_path
-        self.token_path = token_path
-        self.service = self._authenticate()
+
+    def __init__(self,messages=None):
+        self.ensure_model("en_core_web_sm")
         self.nlp = self._load_spacy_model()
+        self.messages = messages
+
+    def ensure_model(self,model="en_core_web_sm"):
+        try:
+            import importlib
+            importlib.import_module(model)
+        except ImportError:
+            subprocess.check_call(
+                [sys.executable, "-m", "spacy", "download", model])
 
     def _load_spacy_model(self):
         """Load spacy NER model for name detection. Falls back to None if unavailable."""
         if not HAS_SPACY:
             return None
-
         try:
             return spacy.load('en_core_web_sm')
         except Exception as e:
             print(f"Warning: Could not load spacy model: {e}")
             return None
 
-    def _authenticate(self):
-        creds = None
-
-        # ✅ Load existing token
-        if os.path.exists(self.token_path):
-            creds = Credentials.from_authorized_user_file(
-                self.token_path,
-                self.SCOPES
-            )
-
-        # ✅ If expired, refresh silently
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
-        # ✅ If no valid creds → login once
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                self.credentials_path,
-                self.SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-
-            # Save for future reuse
-            with open(self.token_path, 'w') as token:
-                token.write(creds.to_json())
-
-        return build('gmail', 'v1', credentials=creds)
-
-    # ---------- Gmail ----------
-    def list_messages(self, query='from:airbnb subject:"Reservation confirmed"', max_results=10) -> List[Dict]:
-        results = self.service.users().messages().list(
-            userId='me',
-            maxResults=max_results,
-            q=query
-        ).execute()
-
-        return results.get('messages', [])
-
-    def get_message(self, msg_id: str) -> Dict:
-        return self.service.users().messages().get(
-            userId='me',
-            id=msg_id
-        ).execute()
-
     def get_body(self, message: Dict) -> Optional[str]:
+        if isinstance(message.get('body'), str):
+            return message['body']
+
+        if isinstance(message.get('text'), str):
+            return message['text']
+
         payload = message.get('payload', {})
 
         if 'data' in payload.get('body', {}):
@@ -97,8 +62,16 @@ class GmailAirbnbReader:
 
         return None
 
+    def get_subject(self, message: Dict) -> Optional[str]:
+        """Extract the subject line from message headers."""
+        headers = message.get('payload', {}).get('headers', [])
+        for header in headers:
+            if header.get('name') == 'Subject':
+                return header.get('value')
+        return None
+
     # ---------- Parsing ----------
-    def parse_airbnb_email(self, text: Optional[str]) -> Dict:
+    def parse_airbnb_email(self, text: Optional[str], subject: Optional[str] = None) -> Dict:
         data = {}
 
         if not text:
@@ -107,41 +80,59 @@ class GmailAirbnbReader:
         # Normalize non-breaking spaces that appear in copied Gmail/Airbnb content.
         body = re.sub(r'[\u00A0\u202F]', ' ', text)
 
-        name = re.search(r'Guest[:\s]+(.+)', body)
-        if name:
-            data['guest'] = name.group(1).strip()
+        # First, try to extract guest name from "Identity verified" pattern
+        guest_name_identity = self.extract_guest_name(body)
+        if guest_name_identity:
+            data['guest'] = guest_name_identity
 
-        # Use NER to detect guest names
-        detected_names = self.extract_guest_names_ner(body)
-        if detected_names:
-            data['guest_names_ner'] = detected_names
-            # Prefer the first detected name as primary guest if not already extracted
-            if not data.get('guest'):
-                data['guest'] = detected_names[0]
+        # Try to extract reservation ID from subject if it's a cancellation email
+        # Pattern: "Canceled: Reservation HMD2KFC4JB for May 21 – 26, 2026"
+        reservation_id = None
+        if subject:
+            subject_match = re.search(r'Canceled:\s+Reservation\s+([A-Z0-9]+)', subject, flags=re.IGNORECASE)
+            if subject_match:
+                reservation_id = subject_match.group(1).strip()
+                data['status'] = 'canceled'
+            else:
+                data['status'] = 'confirmed'
+        else:
+            data['status'] = 'confirmed'
 
-        reservation_id = re.search(r'Confirmation\s+code\s+([A-Z0-9]+)', body, flags=re.IGNORECASE)
+        # If not found in subject, try body patterns
         if not reservation_id:
-            reservation_id = re.search(r'/details/([A-Z0-9]{8,})', body)
+            reservation_id = re.search(r'Confirmation\s+code\s+([A-Z0-9]+)', body, flags=re.IGNORECASE)
+            if not reservation_id:
+                reservation_id = re.search(r'/details/([A-Z0-9]{8,})', body)
+
         if reservation_id:
-            data['reservation_id'] = reservation_id.group(1).strip()
+            data['reservation_id'] = reservation_id.group(1).strip() if hasattr(reservation_id, 'group') else reservation_id
+
+        # Try to extract dates from subject for cancellation emails
+        # Pattern: "Canceled: Reservation HMD2KFC4JB for May 21 – 26, 2026"
+        if subject and not data.get('checkin'):
+            subject_dates = re.search(
+                r'for\s+([A-Za-z]+)\s+(\d{1,2})\s*[–-]\s*(\d{1,2}),?\s*(\d{4})',
+                subject,
+                flags=re.IGNORECASE
+            )
+            if subject_dates:
+                month_name = subject_dates.group(1)
+                start_day = subject_dates.group(2)
+                end_day = subject_dates.group(3)
+                year = subject_dates.group(4)
+                data.setdefault('checkin', f"{month_name} {start_day}, {year}")
+                data.setdefault('checkout', f"{month_name} {end_day}, {year}")
 
         dates = re.search(
             r'(\d{1,2} \w+ \d{4})\s*-\s*(\d{1,2} \w+ \d{4})',
             body
         )
-        if dates:
-            data['checkin'] = dates.group(1)
-            data['checkout'] = dates.group(2)
-
-        # Airbnb reservation emails usually include day/time (without year).
-        checkin = re.search(r'Check-in\s+([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{1,2}:\d{2}\s*[AP]M)', body)
-        if checkin:
-            data['checkin'] = checkin.group(1).strip()
-
-        checkout = re.search(r'Checkout\s+([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{1,2}:\d{2}\s*[AP]M)', body)
-        if checkout:
-            data['checkout'] = checkout.group(1).strip()
-
+        checkin_line = re.search(r'Check-in:\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})', body, flags=re.IGNORECASE)
+        checkout_line = re.search(r'Check-out:\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})', body, flags=re.IGNORECASE)
+        if checkin_line:
+            data.setdefault('checkin', checkin_line.group(1).strip())
+        if checkout_line:
+            data.setdefault('checkout', checkout_line.group(1).strip())
         # Fallback for table layout: "Check-in Checkout / Thu, Jun 4 Tue, Jun 9".
         date_table = re.search(
             r'Check-in\s+Checkout\s+([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2})\s+([A-Za-z]{3},\s+[A-Za-z]{3}\s+\d{1,2})',
@@ -160,6 +151,9 @@ class GmailAirbnbReader:
         if date_table and time_row:
             data['checkin'] = f"{date_table.group(1).strip()} {time_row.group(1).strip()}"
             data['checkout'] = f"{date_table.group(2).strip()} {time_row.group(2).strip()}"
+        elif dates:
+            data.setdefault('checkin', dates.group(1).strip())
+            data.setdefault('checkout', dates.group(2).strip())
 
         guests = re.search(
             r'GUESTS\s+(.+?)(?:\s+MORE DETAILS ABOUT WHO\S* COMING|\s+CONFIRMATION CODE|$)',
@@ -170,7 +164,7 @@ class GmailAirbnbReader:
             data['guests'] = ' '.join(guests.group(1).split())
             data['guest_counts'] = self.parse_guests(data['guests'])
 
-        host_payout = re.search(r'You earn\s+€\s?([\d,.]+)', body, flags=re.IGNORECASE)
+        host_payout = re.search(r'(?:You earn\s+€|Total paid:\s*[€$£]?)\s?([\d,.]+)', body, flags=re.IGNORECASE)
         if host_payout:
             data['host_payout'] = host_payout.group(1).strip()
 
@@ -180,7 +174,7 @@ class GmailAirbnbReader:
         if not value:
             return None
 
-        for fmt in ('%d %B %Y', '%a, %b %d %I:%M %p', '%a, %b %d'):
+        for fmt in ('%d %B %Y', '%B %d, %Y', '%a, %b %d %I:%M %p', '%a, %b %d'):
             try:
                 parsed = datetime.strptime(value, fmt)
                 if fmt in ('%a, %b %d %I:%M %p', '%a, %b %d'):
@@ -238,37 +232,96 @@ class GmailAirbnbReader:
 
         return names
 
-    # ---------- Business logic ----------
-    def get_reservations_for_month(self, year: int, month: int):
-        start = datetime(year, month, 1)
-        end = datetime(year + (month // 12), (month % 12) + 1, 1)
+    def extract_guest_name(self, text: Optional[str]) -> Optional[str]:
+        """Extract guest name that appears before 'Identity verified' text.
 
-        query = (
-            f"from:airbnb subject:\"Reservation confirmed\" "
-            f"after:{start.strftime('%Y/%m/%d')} before:{end.strftime('%Y/%m/%d')}"
+        Looks for text pattern: (Guest name) followed by 'Identity verified'
+        Returns the guest name if found.
+        """
+        if not text:
+            return None
+        guest_first_name = self.extract_guest_first_name_from_welcome_line(
+            text)
+
+        if not guest_first_name:
+            return None
+
+        # Prefer scanning the section before "Identity verified" where Airbnb shows the guest profile block.
+        identity_index = re.search(r'Identity\s+verified', text, flags=re.IGNORECASE)
+        search_area = text[:identity_index.start()] if identity_index else text
+        forbidden_all_caps = r'(?:ARRIVES|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)'
+        pattern = rf'''
+        \b{re.escape(guest_first_name)}                              # first name
+        (?:(?:[ \t]+|\r?\n(?!\r?\n)))                     # spaces/tabs or single newline (no blank line)
+        (?!send\b)                                        # disallow 'Send' token
+        (?!{forbidden_all_caps}\b)                        # disallow exact forbidden ALL-CAPS words as last name
+        (?!\d+\b)                                         # disallow a purely numeric token (dates)
+        (?!\d{{1,2}}[:/.-]\d{{1,2}}(?:[:/.-]\d{{2,4}})?\b) # disallow common date formats like 26, 05/26/2026, 05-26
+        [A-ZÄÖÜẞ][A-Za-zÄÖÜäöüß'’-]+                      # last name part 1 (capitalized, allows umlauts/apostrophe/hyphen)
+        (?:\s+[A-ZÄÖÜẞ][A-Za-zÄÖÜäöüß'’-]+)?              # optional second capitalized part (e.g., compound surnames)
+        \b
+        '''
+        regex = re.compile(pattern, re.VERBOSE)
+        matches = re.findall(regex, search_area)
+        if len(matches) == 1:
+            return matches[0]
+        else:
+            return guest_first_name
+
+    def extract_guest_first_name_from_welcome_line(self, text: Optional[str]) -> Optional[str]:
+        """Extract first name from Airbnb phrase ending in 'or welcome NAME'."""
+        if not text:
+            return None
+
+        match = re.search(
+            r'Send\s+a\s+message\s+to\s+confirm\s+check-?in\s+details\s+or\s+welcome\s+([A-Za-z][A-Za-z\-\']*)',
+            text,
+            flags=re.IGNORECASE,
         )
-        messages = self.list_messages(query=query, max_results=50)
+        if not match:
+            return None
 
+        matched_name = match.group(1)
+        first_name = matched_name.strip(" .,!?:;\"'()[]{}") if matched_name else ""
+        return first_name.capitalize() if first_name else None
+
+
+    def get_reservations(self):
         reservations = []
+        for msg_data in self.messages:
 
-        for msg in messages:
-            msg_data = self.get_message(msg['id'])
             body = self.get_body(msg_data)
-            parsed = self.parse_airbnb_email(body)
+            subject = self.get_subject(msg_data)
+            parsed = self.parse_airbnb_email(body, subject=subject)
 
-            if not parsed.get("checkin"):
+            if not parsed.get("checkin") and not parsed.get("checkout"):
                 continue
+            # Get the year from message['sent_date']
+            year = msg_data['sent_date'][:4] if msg_data.get('sent_date') else None
+            if year:
+                try:
+                    year = int(year)
+                except ValueError:
+                    year = datetime.now().year
+            else:
+                year = datetime.now().year
+            checkin = self._parse_reservation_date(parsed.get('checkin', ''), year)
+            checkout = self._parse_reservation_date(parsed.get('checkout', ''), year)
+            #
+            parsed['checkin'] = checkin.strftime('%d/%m/%Y')
+            parsed['checkout'] = checkout.strftime('%d/%m/%Y')
+            reservations.append(parsed)
 
-            checkin = self._parse_reservation_date(parsed.get('checkin', ''), start.year)
-            checkout = self._parse_reservation_date(parsed.get('checkout', ''), start.year)
+        cancel_ids = []
+        clean_reservations = []
+        for reservation in  reservations:
+            if reservation['status'] == 'canceled':
+                cancel_ids.append(reservation['reservation_id'])
+            else:
+                clean_reservations.append(reservation)
 
-            if not checkin or not checkout:
-                continue
+        for reservation in clean_reservations:
+            if reservation['reservation_id'] in cancel_ids:
+                reservation['status'] = 'canceled'
+        return clean_reservations
 
-            if checkout < checkin:
-                checkout = checkout.replace(year=checkout.year + 1)
-
-            if checkin < end and checkout > start:
-                reservations.append(parsed)
-
-        return reservations
