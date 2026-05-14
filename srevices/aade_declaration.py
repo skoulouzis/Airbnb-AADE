@@ -262,14 +262,28 @@ class AADEDeclaration:
             element_id: Full id of the ``<input>`` element, e.g. ``appForm:rentalFrom_input``.
             date_str: Date string, e.g. ``'21/05/2026'``.
         """
-        el = self.wait.until(EC.presence_of_element_located((By.ID, element_id)))
-        self.driver.execute_script(
-            "arguments[0].removeAttribute('readonly');"
-            "arguments[0].value = arguments[1];"
-            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
-            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
-            el, date_str,
-        )
+        for attempt in range(3):
+            try:
+                self.wait.until(EC.presence_of_element_located((By.ID, element_id)))
+                ok = self.driver.execute_script(
+                    "var el = document.getElementById(arguments[0]);"
+                    "if(!el){ return false; }"
+                    "el.removeAttribute('readonly');"
+                    "el.value = arguments[1];"
+                    "el.dispatchEvent(new Event('input', {bubbles:true}));"
+                    "el.dispatchEvent(new Event('change', {bubbles:true}));"
+                    "return true;",
+                    element_id,
+                    date_str,
+                )
+                if ok:
+                    return
+            except StaleElementReferenceException:
+                if attempt == 2:
+                    self._take_screenshot(f"error_date_input_{element_id}_stale")
+                    raise
+        self._take_screenshot(f"error_date_input_{element_id}_not_found")
+        raise TimeoutException(f"Could not set date input: {element_id}")
 
     # ------------------------------------------------------------------
     # Form filling
