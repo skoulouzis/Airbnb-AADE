@@ -4,12 +4,17 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
-
-from trio import sleep
+import time
+from numpy import random
 
 try:
     from selenium import webdriver
-    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+    from selenium.common.exceptions import (
+        ElementClickInterceptedException,
+        InvalidElementStateException,
+        StaleElementReferenceException,
+        TimeoutException,
+    )
     from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.common.by import By
     from selenium.webdriver.remote.webdriver import WebDriver
@@ -19,6 +24,7 @@ except ImportError:  # pragma: no cover - handled at runtime with explicit messa
     webdriver = None
     TimeoutException = RuntimeError  # type: ignore[assignment]
     StaleElementReferenceException = RuntimeError  # type: ignore[assignment]
+    InvalidElementStateException = RuntimeError  # type: ignore[assignment]
     ChromeOptions = None
     By = None
     WebDriver = Any
@@ -35,6 +41,7 @@ class AADEDeclaration:
     """
 
     BASE_URL = "https://www1.gsis.gr/taxisnet/short_term_letting/views/declarationSearch.xhtml"
+    # BASE_URL = 'file:///home/alogo/Downloads/%CE%94%CE%AE%CE%BB%CF%89%CF%83%CE%B7%20%CE%92%CF%81%CE%B1%CF%87%CF%85%CF%87%CF%81%CF%8C%CE%BD%CE%B9%CE%B1%CF%82%20%CE%94%CE%B9%CE%B1%CE%BC%CE%BF%CE%BD%CE%AE%CF%82.html'
 
     def __init__(
             self,
@@ -90,25 +97,33 @@ class AADEDeclaration:
         self.close()
 
     def _first_visible(self, selectors: Iterable[tuple[str, str]]):
-        for by, value in selectors:
+        selector_list = list(selectors)
+        per_selector_timeout = max(3, min(8, self.timeout_seconds // 3))
+        for by, value in selector_list:
             try:
-                return self.wait.until(
-                    EC.visibility_of_element_located((by, value)))
+                return WebDriverWait(self.driver, per_selector_timeout).until(
+                    EC.visibility_of_element_located((by, value))
+                )
             except TimeoutException:
                 continue
         self._take_screenshot("error_visible_selector_not_found")
         raise TimeoutException(
-            f"No visible element matched selectors: {selectors}")
+            f"No visible element matched selectors: {selector_list}")
 
     def _first_clickable(self, selectors: Iterable[tuple[str, str]]):
-        for by, value in selectors:
+        selector_list = list(selectors)
+        per_selector_timeout = max(3, min(8, self.timeout_seconds // 3))
+        for by, value in selector_list:
             try:
-                return self.wait.until(EC.element_to_be_clickable((by, value)))
+                clickable = WebDriverWait(self.driver, per_selector_timeout).until(
+                    EC.element_to_be_clickable((by, value))
+                )
+                return clickable
             except TimeoutException:
                 continue
         self._take_screenshot("error_clickable_selector_not_found")
         raise TimeoutException(
-            f"No clickable element matched selectors: {selectors}")
+            f"No clickable element matched selectors: {selector_list}")
 
     def open_property_page(self, property_id: str | None = None) -> None:
         target_property_id = property_id or self.property_id
@@ -191,7 +206,7 @@ class AADEDeclaration:
             component_id: PrimeFaces component root id, e.g. ``appForm:paymentType``
             value_or_label: The option value (e.g. ``"1"``) or its visible text label.
         """
-        import time
+
 
         panel_id = f"{component_id}_panel"
 
@@ -207,8 +222,6 @@ class AADEDeclaration:
             )
             # Try a regular click first; fall back to JS click if panel doesn't open.
             trigger.click()
-            time.sleep(0.4)
-
             # Check if panel became visible; if not, try JS click.
             try:
                 self.wait.until(EC.visibility_of_element_located((By.ID, panel_id)))
@@ -238,7 +251,10 @@ class AADEDeclaration:
         items = panel.find_elements(By.CSS_SELECTOR, "li.ui-selectonemenu-item")
         for item in items:
             label = item.get_attribute("data-label") or item.text
-            if label == value_or_label or item.get_attribute("data-value") == value_or_label:
+            print('Checking dropdown item:', label, 'against', value_or_label)
+            data_value = item.get_attribute("data-value")
+            print('Item data-value:', data_value)
+            if label == value_or_label or data_value == value_or_label:
                 item.click()
                 return
 
@@ -262,9 +278,13 @@ class AADEDeclaration:
             element_id: Full id of the ``<input>`` element, e.g. ``appForm:rentalFrom_input``.
             date_str: Date string, e.g. ``'21/05/2026'``.
         """
-        for attempt in range(3):
+        last_value = None
+        for attempt in range(5):
             try:
-                self.wait.until(EC.presence_of_element_located((By.ID, element_id)))
+                elem = self.wait.until(EC.presence_of_element_located((By.ID, element_id)))
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+
+                # PrimeFaces date fields are often readonly and need JS + blur to persist.
                 ok = self.driver.execute_script(
                     "var el = document.getElementById(arguments[0]);"
                     "if(!el){ return false; }"
@@ -272,18 +292,102 @@ class AADEDeclaration:
                     "el.value = arguments[1];"
                     "el.dispatchEvent(new Event('input', {bubbles:true}));"
                     "el.dispatchEvent(new Event('change', {bubbles:true}));"
+                    "el.dispatchEvent(new Event('blur', {bubbles:true}));"
                     "return true;",
                     element_id,
                     date_str,
                 )
+
+                WebDriverWait(self.driver, 2).until(
+                    lambda d: d.find_element(By.ID, element_id).get_attribute("value") == date_str
+                )
                 if ok:
                     return
-            except StaleElementReferenceException:
+            except (StaleElementReferenceException, TimeoutException):
+                last_value = self.driver.execute_script(
+                    "var el = document.getElementById(arguments[0]); return el ? el.value : null;",
+                    element_id,
+                )
+                if attempt == 4:
+                    break
+                time.sleep(0.25)
+
+        self._take_screenshot(f"error_date_input_{element_id}_value_mismatch")
+        raise ValueError(
+            f"Failed to set date input '{element_id}' to '{date_str}'. "
+            f"Final value: '{last_value}'"
+        )
+
+    def _ensure_date_input_value(self, element_id: str, date_str: str, attempts: int = 3) -> None:
+        """Ensure a date input still has the expected value, re-applying when needed."""
+        for attempt in range(attempts):
+            current_value = self.driver.execute_script(
+                "var el = document.getElementById(arguments[0]); return el ? el.value : null;",
+                element_id,
+            )
+            if current_value == date_str:
+                return
+            self._set_date_input(element_id, date_str)
+            if attempt < attempts - 1:
+                time.sleep(0.2)
+
+        final_value = self.driver.execute_script(
+            "var el = document.getElementById(arguments[0]); return el ? el.value : null;",
+            element_id,
+        )
+        self._take_screenshot(f"error_date_input_{element_id}_ensure_failed")
+        raise ValueError(
+            f"Date input '{element_id}' did not persist value '{date_str}'. "
+            f"Final value: '{final_value}'"
+        )
+
+    def _set_text_input(self, element_id: str, value: str) -> None:
+        """Set text input value with Selenium first, then JS fallback when needed."""
+        locator = (By.ID, element_id)
+        target_value = str(value)
+        for attempt in range(3):
+            try:
+                elem = self.wait.until(EC.presence_of_element_located(locator))
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+
+                if elem.is_enabled() and not (elem.get_attribute("readonly") or ""):
+                    elem.clear()
+                    elem.send_keys(target_value)
+                    # Blur helps PrimeFaces persist model updates on some fields.
+                    self.driver.execute_script(
+                        "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
+                        elem,
+                    )
+                else:
+                    self.driver.execute_script(
+                        "arguments[0].removeAttribute('readonly');"
+                        "arguments[0].value = arguments[1];"
+                        "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                        "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));"
+                        "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
+                        elem,
+                        target_value,
+                    )
+
+                WebDriverWait(self.driver, 2).until(
+                    lambda d: (d.find_element(*locator).get_attribute("value") or "").strip() == target_value.strip()
+                )
+                current_value = self.driver.find_element(*locator).get_attribute("value")
+                if (current_value or "").strip() == target_value.strip():
+                    return
+            except (InvalidElementStateException, StaleElementReferenceException):
                 if attempt == 2:
-                    self._take_screenshot(f"error_date_input_{element_id}_stale")
+                    self._take_screenshot(f"error_text_input_{element_id}")
                     raise
-        self._take_screenshot(f"error_date_input_{element_id}_not_found")
-        raise TimeoutException(f"Could not set date input: {element_id}")
+            except TimeoutException:
+                if attempt == 2:
+                    self._take_screenshot(f"error_text_input_{element_id}_timeout")
+                    raise
+
+            time.sleep(0.3)
+
+        self._take_screenshot(f"error_text_input_{element_id}_value_mismatch")
+        raise ValueError(f"Failed to set input '{element_id}' to '{value}'.")
 
     # ------------------------------------------------------------------
     # Form filling
@@ -305,7 +409,7 @@ class AADEDeclaration:
         payment_method Method of Payment (value or label)         appForm:paymentType
         platform       E-platform (value or label)                appForm:platform
         tenant_tin     Tax Identification No                       appForm:renterAfm
-        tenant_full_name Full name (auto-filled after TIN lookup)  appForm:renterName
+        tenant_full_name Full name                                appForm:renterName
         is_foreigner   Foreigner checkbox                          appForm:foreignCheckBox
         passport_id    Passport ID (enabled after checking foreign)appForm:renterIdCard
         notes          Notes                                       appForm:j_idt93
@@ -318,27 +422,34 @@ class AADEDeclaration:
                          8 = TripAdvisor Rentals/Holiday Lettings, 9 = Other platforms.
         """
         # --- Arrival date ---
+        print("Setting arrival date to:", declaration_data['arrival_date'])
         self._set_date_input("appForm:rentalFrom_input", declaration_data['arrival_date'])
-        sleep(0.5)
+
         # --- Departure date ---
+        print("Setting departure date to:", declaration_data['departure_date'])
         self._set_date_input("appForm:rentalTo_input", declaration_data['departure_date'])
-        sleep( 0.5)
+
         # --- Total agreed rent ---
-        rent_input = self._first_visible([(By.ID, "appForm:sumAmount_input")])
-        rent_input.clear()
-        rent_input.send_keys(declaration_data['total_rent'])
+        print("Setting total rent to:", declaration_data['total_rent'])
+        self._set_text_input("appForm:sumAmount_input", str(declaration_data['total_rent']))
 
         # --- Method of payment (PrimeFaces dropdown) ---
+        print("Setting payment method to:", declaration_data['payment_method'])
         self._select_primefaces_dropdown("appForm:paymentType", declaration_data['payment_method'])
 
         # --- E-platform (PrimeFaces dropdown) ---
+        print("Setting platform to:", declaration_data['platform'])
         self._select_primefaces_dropdown("appForm:platform", declaration_data['platform'])
+        tenant_full_name = declaration_data.get('tenant_full_name')
+        if tenant_full_name:
+            print("Setting tenant full name to:", tenant_full_name)
+            self._set_text_input("appForm:renterName", str(tenant_full_name))
         tenant_tin = declaration_data.get('tenant_tin')
         # --- Tenant TIN ---
         if tenant_tin:
-            tin_input = self._first_visible([(By.ID, "appForm:renterAfm")])
-            tin_input.clear()
-            tin_input.send_keys(tenant_tin)
+            print("Setting tenant tin  to:", tenant_tin)
+            self._set_text_input("appForm:renterAfm", str(tenant_tin))
+            tin_input = self.wait.until(EC.presence_of_element_located((By.ID, "appForm:renterAfm")))
             # Trigger blur so the form can auto-fill name via AJAX if applicable.
             self.driver.execute_script(
                 "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
@@ -349,43 +460,90 @@ class AADEDeclaration:
         is_foreigner = declaration_data.get('is_foreigner', False)
         passport_id = declaration_data.get('passport_id')
         if not passport_id:
+            print("Passport ID not provided, falling back to reservation_id:", declaration_data.get('reservation_id'))
             passport_id = declaration_data.get('reservation_id')  # fallback to reservation_id if passport_id not provided
         if is_foreigner:
-            checkbox_box = self._first_clickable(
-                [(By.CSS_SELECTOR, "#appForm\\:foreignCheckBox .ui-chkbox-box")]
-            )
-            if "ui-state-default" in (checkbox_box.get_attribute("class") or ""):
-                checkbox_box.click()  # tick it only if currently unchecked
+            try:
+                print("Setting passport id to:", passport_id)
+                checkbox_box = self._first_clickable(
+                    [
+                        (By.CSS_SELECTOR, "#appForm\\:foreignCheckBox .ui-chkbox-box"),
+                        (By.CSS_SELECTOR, "[id*='foreignCheckBox'] .ui-chkbox-box"),
+                        (By.XPATH, "//input[@id='appForm:foreignCheckBox']/.."),
+                        (By.XPATH, "//span[contains(@id, 'foreignCheckBox')]"),
+                    ]
+                )
+                if "ui-state-default" in (checkbox_box.get_attribute("class") or ""):
+                    checkbox_box.click()  # tick it only if currently unchecked
+                # Wait for the foreigner checkbox to enable the passport field.
+                WebDriverWait(self.driver, 5).until(
+                    lambda d: d.find_element(By.ID, "appForm:renterIdCard").is_enabled()
+                )
+            except TimeoutException:
+                self._take_screenshot("warning_foreigner_checkbox_not_found")
+                # Checkbox may not be present or may need a JS fallback on some forms.
+                try:
+                    self.driver.execute_script(
+                        "var cb = document.getElementById('appForm:foreignCheckBox');"
+                        "if(cb){"
+                        "  cb.checked = true;"
+                        "  cb.dispatchEvent(new Event('click', {bubbles:true}));"
+                        "  cb.dispatchEvent(new Event('change', {bubbles:true}));"
+                        "}"
+                    )
+                    WebDriverWait(self.driver, 5).until(
+                        lambda d: d.find_element(By.ID, "appForm:renterIdCard").is_enabled()
+                    )
+                except TimeoutException:
+                    self._take_screenshot("warning_foreigner_checkbox_enable_failed")
+                    pass
 
             if passport_id:
                 # Field is enabled after checking the foreigner box.
-                passport_locator = (By.ID, "appForm:renterIdCard")
-                passport_wait = WebDriverWait(
-                    self.driver,
-                    self.timeout_seconds,
-                    ignored_exceptions=(StaleElementReferenceException,),
+                passport_field = self.wait.until(
+                    EC.presence_of_element_located((By.ID, "appForm:renterIdCard"))
                 )
-                for attempt in range(3):
-                    try:
-                        passport_input = passport_wait.until(
-                            EC.element_to_be_clickable(passport_locator)
-                        )
-                        passport_input.clear()
-                        passport_input.send_keys(str(passport_id))
-                        break
-                    except StaleElementReferenceException:
-                        if attempt == 2:
-                            self._take_screenshot("error_passport_stale_element")
-                            raise
+                if not passport_field.is_enabled():
+                    self.driver.execute_script(
+                        "arguments[0].removeAttribute('disabled');"
+                        "arguments[0].removeAttribute('readonly');",
+                        passport_field,
+                    )
+                self._set_text_input("appForm:renterIdCard", str(passport_id))
+
+        # Some AADE AJAX updates can clear renter name after other field changes.
+        if tenant_full_name:
+            print("Re-setting tenant full name to ensure persistence:", tenant_full_name)
+            self._set_text_input("appForm:renterName", str(tenant_full_name))
 
         # --- Notes ---
         notes = declaration_data.get('notes')
         if notes:
-            notes_el = self._first_visible(
-                [(By.CSS_SELECTOR, "textarea[name='appForm:j_idt93']")]
-            )
-            notes_el.clear()
-            notes_el.send_keys(notes)
+            print("Setting notes to:", notes)
+            try:
+                notes_el = self._first_visible(
+                    [
+                        (By.CSS_SELECTOR, "textarea[name='appForm:j_idt93']"),
+                        (By.XPATH, "//textarea[contains(@name, 'j_idt')]"),
+                        (By.XPATH, "//textarea[@name='appForm:j_idt93']"),
+                    ]
+                )
+                self.driver.execute_script(
+                    "arguments[0].removeAttribute('readonly');"
+                    "arguments[0].removeAttribute('disabled');"
+                    "arguments[0].value = arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                    notes_el,
+                    str(notes),
+                )
+            except TimeoutException:
+                self._take_screenshot("warning_notes_textarea_not_found")
+                pass
+
+        # Final guard: PrimeFaces AJAX updates can clear date inputs after later edits.
+        self._ensure_date_input_value("appForm:rentalFrom_input", declaration_data['arrival_date'])
+        self._ensure_date_input_value("appForm:rentalTo_input", declaration_data['departure_date'])
 
         self._take_screenshot("filled_declaration_fields")
 
@@ -411,24 +569,50 @@ class AADEDeclaration:
         self.open_property_page(property_id=self.property_id)
         self.login(username=self.username or "", password=self.password or "")
         self.click_new_declaration()
-        self.fill_declaration_fields(declaration_data = declaration_data )
+        # self.fill_declaration_fields(declaration_data = declaration_data )
         if submit:
             self.submit_declaration()
         elif save:
             self.save_draft()
 
     def save_draft(self) -> None:
-        self._take_screenshot("before_save_draft")
-        self._first_clickable(
+        self._take_screenshot("before_save_draft_click")
+
+        actions_button = self._first_clickable(
             [
-                (By.XPATH,
-                 "//button[contains(., 'Προσωρινή Αποθήκευση') or contains(., 'Αποθήκευση') or contains(., 'Save Draft') or contains(., 'Save')]"),
-                (By.XPATH,
-                 "//a[contains(., 'Προσωρινή Αποθήκευση') or contains(., 'Αποθήκευση') or contains(., 'Save Draft') or contains(., 'Save')]"),
-                (By.CSS_SELECTOR, "button[id*='save']"),
-                (By.CSS_SELECTOR, "button[id*='draft']"),
-                (By.CSS_SELECTOR, "a[id*='save']"),
-                (By.CSS_SELECTOR, "a[id*='draft']"),
+                (By.ID, "appForm:beneficiariesActions_button"),
+                (By.ID, "appForm:beneficiariesActionsTop_button"),
+                (By.CSS_SELECTOR, "[id$='beneficiariesActions_button']"),
+                (By.CSS_SELECTOR, "[id$='beneficiariesActionsTop_button']"),
             ]
-        ).click()
+        )
+        try:
+            actions_button.click()
+        except ElementClickInterceptedException:
+            self.driver.execute_script("arguments[0].click();", actions_button)
+
+        # Opened menu can be top or bottom depending on viewport.
+        draft_action = self._first_clickable(
+            [
+                (By.CSS_SELECTOR, "#appForm\\:beneficiariesActions_menu a[title*='Draft']"),
+                (By.CSS_SELECTOR, "#appForm\\:beneficiariesActionsTop_menu a[title*='Draft']"),
+                (By.XPATH,
+                 "//a[contains(@title, 'Προσωρινή Αποθήκευση') or contains(., 'Προσωρινή Αποθήκευση') or contains(@title, 'Draft') or contains(., 'Draft')]"),
+            ]
+        )
+        try:
+            draft_action.click()
+        except ElementClickInterceptedException:
+            self.driver.execute_script("arguments[0].click();", draft_action)
+
+        # PrimeFaces save is async; wait for active AJAX calls to finish.
+        WebDriverWait(self.driver, max(5, self.timeout_seconds)).until(
+            lambda d: d.execute_script("return (window.jQuery && jQuery.active) ? jQuery.active === 0 : true;")
+        )
+        WebDriverWait(self.driver, max(5, self.timeout_seconds)).until(
+            lambda d: (
+                len(d.find_elements(By.ID, "appForm:continueToMitroo")) > 0
+                or len(d.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Επιτυχής Αποθήκευση') or contains(normalize-space(.), 'Successful Save') ]")) > 0
+            )
+        )
         self._take_screenshot("after_save_draft_click")

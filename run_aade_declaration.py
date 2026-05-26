@@ -45,7 +45,7 @@ def main() -> None:
                          default=bool(cfg.get("headless", False)))
     submit = _env_bool("AADE_SUBMIT", default=bool(cfg.get("submit", False)))
     screenshots = _env_bool("AADE_SCREENSHOTS",
-                            default=bool(cfg.get("screenshots", True)))
+                            default=bool(cfg.get("screenshots", False)))
     screenshots_dir = os.getenv("AADE_SCREENSHOTS_DIR",
                                 str(cfg.get("screenshots_dir",
                                             "aade_screenshots")))
@@ -54,12 +54,13 @@ def main() -> None:
         "arrival_date": "21/05/2026",
         "departure_date": "26/05/2026",
         "total_rent": "350,00",
-        "payment_method": "3",
-        "platform": "1",
+        "payment_method": 'Μετρητά',
+        "platform": 'Airbnb',
         "is_foreigner": True,
         "passport_id": "AB123456",
-        "notes": "κωδικός_κράτησης:HMD2KFC4JB",
-        "reservation_id": "HMD2KFC4JB"
+        "notes": "κωδικός_κράτησης:HMD2KFC4JB, test delete me",
+        "reservation_id": "HMD2KFC4JB",
+        "tenant_full_name": "John Doe",
     }
     aade = AADEDeclaration(
         headless=headless,
