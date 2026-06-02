@@ -5,12 +5,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 import time
-from numpy import random
 
 try:
     from selenium import webdriver
     from selenium.common.exceptions import (
         ElementClickInterceptedException,
+        ElementNotInteractableException,
         InvalidElementStateException,
         StaleElementReferenceException,
         TimeoutException,
@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - handled at runtime with explicit messa
     TimeoutException = RuntimeError  # type: ignore[assignment]
     StaleElementReferenceException = RuntimeError  # type: ignore[assignment]
     InvalidElementStateException = RuntimeError  # type: ignore[assignment]
+    ElementClickInterceptedException = RuntimeError  # type: ignore[assignment]
+    ElementNotInteractableException = RuntimeError  # type: ignore[assignment]
     ChromeOptions = None
     By = None
     WebDriver = Any
@@ -210,6 +212,19 @@ class AADEDeclaration:
 
         panel_id = f"{component_id}_panel"
 
+        # Wait for any blocking modal overlays to disappear before interacting with dropdown
+        try:
+            WebDriverWait(self.driver, 5).until(
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, ".ui-widget-overlay"))
+            )
+        except TimeoutException:
+            # Modal may not exist or may be stubborn; try to close it with JS
+            self.driver.execute_script(
+                "var overlays = document.querySelectorAll('.ui-widget-overlay');"
+                "overlays.forEach(function(el) { el.style.display='none'; el.style.visibility='hidden'; });"
+            )
+            time.sleep(0.3)
+
         # Try up to 3 times in case of stale element or panel not opening
         for attempt in range(3):
             # Click the visible dropdown trigger to open the panel.
@@ -351,13 +366,24 @@ class AADEDeclaration:
                 self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
 
                 if elem.is_enabled() and not (elem.get_attribute("readonly") or ""):
-                    elem.clear()
-                    elem.send_keys(target_value)
-                    # Blur helps PrimeFaces persist model updates on some fields.
-                    self.driver.execute_script(
-                        "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
-                        elem,
-                    )
+                    try:
+                        elem.clear()
+                        elem.send_keys(target_value)
+                        # Blur helps PrimeFaces persist model updates on some fields.
+                        self.driver.execute_script(
+                            "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
+                            elem,
+                        )
+                    except (InvalidElementStateException, ElementNotInteractableException):
+                        self.driver.execute_script(
+                            "arguments[0].removeAttribute('readonly');"
+                            "arguments[0].value = arguments[1];"
+                            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));"
+                            "arguments[0].dispatchEvent(new Event('blur', {bubbles:true}));",
+                            elem,
+                            target_value,
+                        )
                 else:
                     self.driver.execute_script(
                         "arguments[0].removeAttribute('readonly');"
@@ -375,7 +401,7 @@ class AADEDeclaration:
                 current_value = self.driver.find_element(*locator).get_attribute("value")
                 if (current_value or "").strip() == target_value.strip():
                     return
-            except (InvalidElementStateException, StaleElementReferenceException):
+            except (InvalidElementStateException, ElementNotInteractableException, StaleElementReferenceException):
                 if attempt == 2:
                     self._take_screenshot(f"error_text_input_{element_id}")
                     raise
@@ -569,11 +595,78 @@ class AADEDeclaration:
         self.open_property_page(property_id=self.property_id)
         self.login(username=self.username or "", password=self.password or "")
         self.click_new_declaration()
-        # self.fill_declaration_fields(declaration_data = declaration_data )
+        self.fill_declaration_fields(declaration_data = declaration_data )
         if submit:
             self.submit_declaration()
         elif save:
             self.save_draft()
+
+    def _is_draft_save_success_visible(self) -> bool:
+        """Return True when the save-success dialog is actually visible to the user."""
+        success_button = self.driver.find_elements(By.ID, "appForm:continueToMitrooConfirm")
+        if any(element.is_displayed() for element in success_button):
+            return True
+
+        success_table = self.driver.find_elements(By.ID, "appForm:continueToMitroo")
+        if any(element.is_displayed() for element in success_table):
+            return True
+
+        if self._get_visible_success_messages():
+            return True
+
+        return False
+
+    def _get_visible_message_details(self, detail_selectors: Iterable[str]) -> list[str]:
+        """Collect visible PrimeFaces message details for the given selectors."""
+        messages: list[str] = []
+        for selector in detail_selectors:
+            for detail in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if not detail.is_displayed():
+                        continue
+                except StaleElementReferenceException:
+                    continue
+
+                text = " ".join((detail.text or "").split())
+                if text:
+                    messages.append(text)
+
+        unique_messages: list[str] = []
+        seen: set[str] = set()
+        for message in messages:
+            if message not in seen:
+                unique_messages.append(message)
+                seen.add(message)
+        return unique_messages
+
+    def _get_visible_success_messages(self) -> list[str]:
+        """Collect visible PrimeFaces success/info messages shown after a successful save."""
+        return self._get_visible_message_details(
+            [
+                ".ui-messages-info-detail",
+                ".ui-messages-success-detail",
+                ".ui-growl-message p",
+                ".ui-growl-message span",
+            ]
+        )
+
+    def _get_visible_validation_errors(self) -> list[str]:
+        """Collect visible PrimeFaces validation errors from the messages area."""
+        return self._get_visible_message_details([
+            ".ui-messages-error-detail",
+            ".ui-growl-error p",
+            ".ui-growl-error span",
+        ])
+
+    def _primefaces_ajax_idle(self) -> bool:
+        """Return True when both jQuery and PrimeFaces AJAX queues are idle."""
+        return bool(self.driver.execute_script(
+            "return (function(){"
+            "  var jqIdle = !window.jQuery || jQuery.active === 0;"
+            "  var pfIdle = !window.PrimeFaces || !PrimeFaces.ajax || !PrimeFaces.ajax.Queue || PrimeFaces.ajax.Queue.isEmpty();"
+            "  return jqIdle && pfIdle;"
+            "})();"
+        ))
 
     def save_draft(self) -> None:
         self._take_screenshot("before_save_draft_click")
@@ -605,14 +698,33 @@ class AADEDeclaration:
         except ElementClickInterceptedException:
             self.driver.execute_script("arguments[0].click();", draft_action)
 
-        # PrimeFaces save is async; wait for active AJAX calls to finish.
+        # PrimeFaces save is async; wait for both jQuery and PrimeFaces queues to settle.
         WebDriverWait(self.driver, max(5, self.timeout_seconds)).until(
-            lambda d: d.execute_script("return (window.jQuery && jQuery.active) ? jQuery.active === 0 : true;")
+            lambda d: self._primefaces_ajax_idle()
         )
+
+        # Wait until either a success indicator or validation errors are visible.
         WebDriverWait(self.driver, max(5, self.timeout_seconds)).until(
             lambda d: (
-                len(d.find_elements(By.ID, "appForm:continueToMitroo")) > 0
-                or len(d.find_elements(By.XPATH, "//*[contains(normalize-space(.), 'Επιτυχής Αποθήκευση') or contains(normalize-space(.), 'Successful Save') ]")) > 0
+                self._is_draft_save_success_visible()
+                or bool(self._get_visible_validation_errors())
+                or bool(self._get_visible_success_messages())
             )
         )
+
+        validation_errors = self._get_visible_validation_errors()
+        if validation_errors:
+            self._take_screenshot("error_save_draft_validation_failed")
+            raise ValueError(
+                "Draft save failed with AADE validation errors:\n"
+                + "\n".join(f"- {error}" for error in validation_errors)
+            )
+
+        success_messages = self._get_visible_success_messages()
+        if not self._is_draft_save_success_visible() and not success_messages:
+            self._take_screenshot("error_save_draft_unknown_result")
+            raise TimeoutException(
+                "Draft save did not show a success indicator and no validation errors were captured."
+            )
+
         self._take_screenshot("after_save_draft_click")

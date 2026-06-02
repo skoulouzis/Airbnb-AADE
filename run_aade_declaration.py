@@ -51,8 +51,8 @@ def main() -> None:
                                             "aade_screenshots")))
 
     declaration_data = {
-        "arrival_date": "21/05/2026",
-        "departure_date": "26/05/2026",
+        "arrival_date": "27/05/2026",
+        "departure_date": "31/05/2026",
         "total_rent": "350,00",
         "payment_method": 'Μετρητά',
         "platform": 'Airbnb',
